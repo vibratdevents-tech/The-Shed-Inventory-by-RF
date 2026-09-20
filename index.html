@@ -818,23 +818,77 @@
   };
 
   function compressImage(file, cb){
-    var reader = new FileReader();
-    reader.onerror = function(){ showToast("Couldn't read that photo — try again"); };
-    reader.onload = function(ev){
-      var img = new Image();
-      img.onerror = function(){ showToast("Couldn't read that photo — try again"); };
-      img.onload = function(){
-        var maxDim = 900;
-        var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-        var w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+    var settled = false;
+    var maxDim = 900;
+
+    // Some photos (especially very high-resolution camera shots) can fail to
+    // decode on some devices without ever firing a browser error event. This
+    // timeout guarantees the person always gets told, instead of the form
+    // just sitting there with nothing happening.
+    var watchdog = setTimeout(fail, 9000);
+
+    function finish(dataUrl){
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      cb(dataUrl);
+    }
+    function fail(){
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      showToast("Couldn't read that photo — try a different one or a smaller copy");
+    }
+
+    function drawAndFinish(source, w, h){
+      try {
+        var scale = Math.min(1, maxDim / Math.max(w, h));
+        var outW = Math.max(1, Math.round(w * scale));
+        var outH = Math.max(1, Math.round(h * scale));
         var canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
-        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-        cb(canvas.toDataURL("image/jpeg", 0.75));
+        canvas.width = outW; canvas.height = outH;
+        canvas.getContext("2d").drawImage(source, 0, 0, outW, outH);
+        var dataUrl = canvas.toDataURL("image/jpeg", 0.75);
+        if (!dataUrl || dataUrl.length < 30) { fail(); return; }
+        finish(dataUrl);
+      } catch(e){
+        fail();
+      }
+    }
+
+    // Legacy path: FileReader -> <img>. Used as a fallback for browsers
+    // without createImageBitmap, or when createImageBitmap itself fails.
+    function legacyDecode(){
+      var reader = new FileReader();
+      reader.onerror = fail;
+      reader.onload = function(ev){
+        var img = new Image();
+        img.onerror = fail;
+        img.onload = function(){ drawAndFinish(img, img.naturalWidth, img.naturalHeight); };
+        img.src = ev.target.result;
       };
-      img.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
+      reader.readAsDataURL(file);
+    }
+
+    // Preferred path: createImageBitmap decodes off the main thread, handles
+    // more formats and huge camera photos more reliably, and — when given
+    // resizeWidth — downscales during decode instead of loading the full
+    // multi-megapixel image into memory first.
+    if (window.createImageBitmap){
+      var bitmapPromise;
+      try {
+        bitmapPromise = createImageBitmap(file, { resizeWidth: maxDim, resizeQuality: "medium" });
+      } catch(e){
+        bitmapPromise = createImageBitmap(file);
+      }
+      Promise.resolve(bitmapPromise).then(function(bitmap){
+        drawAndFinish(bitmap, bitmap.width, bitmap.height);
+      }).catch(function(){
+        legacyDecode();
+      });
+    } else {
+      legacyDecode();
+    }
   }
 
   document.getElementById("qtyMinus").onclick = function(){
