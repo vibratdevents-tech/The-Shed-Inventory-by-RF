@@ -808,7 +808,7 @@
   document.getElementById("photoInput").onchange = function(e){
     var file = e.target.files[0];
     if (!file) return;
-    showToast("Adding photo…", 4000);
+    showToast("Adding photo…", 6000);
     compressImage(file, function(dataUrl){
       pendingPhoto = dataUrl;
       updatePhotoPreview();
@@ -819,13 +819,21 @@
 
   function compressImage(file, cb){
     var settled = false;
-    var maxDim = 900;
+    var outputDim = 900; // final stored size — small regardless of the source
 
-    // Some photos (especially very high-resolution camera shots) can fail to
-    // decode on some devices without ever firing a browser error event. This
-    // timeout guarantees the person always gets told, instead of the form
-    // just sitting there with nothing happening.
-    var watchdog = setTimeout(fail, 9000);
+    // A 50MP camera photo can be 6-8000px on a side. Decoding that at full
+    // size before shrinking it is what actually exhausts memory on some
+    // phones — so we ask the browser to decode straight to progressively
+    // smaller targets until one succeeds, rather than trying once and
+    // giving up.
+    var decodeAttempts = [1600, 900, 500];
+    var attemptIndex = 0;
+
+    // Bigger files legitimately need more time to decode — scale the
+    // watchdog instead of using one fixed value, so a slow-but-working
+    // decode on a big file isn't cut off before it finishes.
+    var timeoutMs = Math.min(30000, 9000 + (file.size / (1024 * 1024)) * 1500);
+    var watchdog = setTimeout(function(){ fail(true); }, timeoutMs);
 
     function finish(dataUrl){
       if (settled) return;
@@ -833,62 +841,85 @@
       clearTimeout(watchdog);
       cb(dataUrl);
     }
-    function fail(){
+    function fail(isTimeout){
       if (settled) return;
       settled = true;
       clearTimeout(watchdog);
-      showToast("Couldn't read that photo — try a different one or a smaller copy");
+      var sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+      showToast(
+        "Couldn't process that photo (" + sizeMb + "MB) — try turning off your camera's " +
+        "high-resolution mode, or send it to yourself in a messaging app first to shrink it",
+        6000
+      );
     }
 
-    function drawAndFinish(source, w, h){
+    function drawFromSource(source, w, h, targetDim){
+      var canvas = document.createElement("canvas");
       try {
-        var scale = Math.min(1, maxDim / Math.max(w, h));
+        var scale = Math.min(1, targetDim / Math.max(w, h));
         var outW = Math.max(1, Math.round(w * scale));
         var outH = Math.max(1, Math.round(h * scale));
-        var canvas = document.createElement("canvas");
         canvas.width = outW; canvas.height = outH;
         canvas.getContext("2d").drawImage(source, 0, 0, outW, outH);
         var dataUrl = canvas.toDataURL("image/jpeg", 0.75);
-        if (!dataUrl || dataUrl.length < 30) { fail(); return; }
-        finish(dataUrl);
+        if (!dataUrl || dataUrl.length < 30) return null;
+        return dataUrl;
       } catch(e){
-        fail();
+        return null;
+      } finally {
+        canvas.width = 0; canvas.height = 0; // release memory promptly
       }
     }
 
     // Legacy path: FileReader -> <img>. Used as a fallback for browsers
-    // without createImageBitmap, or when createImageBitmap itself fails.
+    // without createImageBitmap, or when createImageBitmap itself fails
+    // at every size we try.
     function legacyDecode(){
       var reader = new FileReader();
-      reader.onerror = fail;
+      reader.onerror = function(){ fail(); };
       reader.onload = function(ev){
         var img = new Image();
-        img.onerror = fail;
-        img.onload = function(){ drawAndFinish(img, img.naturalWidth, img.naturalHeight); };
+        img.onerror = function(){ fail(); };
+        img.onload = function(){
+          var dataUrl = drawFromSource(img, img.naturalWidth, img.naturalHeight, outputDim);
+          if (dataUrl) finish(dataUrl); else fail();
+        };
         img.src = ev.target.result;
       };
       reader.readAsDataURL(file);
     }
 
-    // Preferred path: createImageBitmap decodes off the main thread, handles
-    // more formats and huge camera photos more reliably, and — when given
-    // resizeWidth — downscales during decode instead of loading the full
-    // multi-megapixel image into memory first.
-    if (window.createImageBitmap){
+    // Preferred path: createImageBitmap decodes more efficiently than an
+    // <img> tag and — when given resizeWidth — many browsers can shrink
+    // during decode instead of holding the full-resolution image in memory
+    // first. Try progressively smaller resize targets: a very high-
+    // resolution original can still exceed a phone's decode limits even at
+    // 1600px, so step down until one actually succeeds.
+    function tryBitmap(){
+      if (!window.createImageBitmap){ legacyDecode(); return; }
+      var targetDim = decodeAttempts[attemptIndex];
       var bitmapPromise;
       try {
-        bitmapPromise = createImageBitmap(file, { resizeWidth: maxDim, resizeQuality: "medium" });
+        bitmapPromise = createImageBitmap(file, { resizeWidth: targetDim, resizeQuality: "medium" });
       } catch(e){
-        bitmapPromise = createImageBitmap(file);
+        bitmapPromise = Promise.reject(e);
       }
-      Promise.resolve(bitmapPromise).then(function(bitmap){
-        drawAndFinish(bitmap, bitmap.width, bitmap.height);
+      bitmapPromise.then(function(bitmap){
+        var dataUrl = drawFromSource(bitmap, bitmap.width, bitmap.height, outputDim);
+        if (bitmap.close) bitmap.close();
+        if (dataUrl){
+          finish(dataUrl);
+        } else {
+          attemptIndex++;
+          if (attemptIndex < decodeAttempts.length) tryBitmap(); else legacyDecode();
+        }
       }).catch(function(){
-        legacyDecode();
+        attemptIndex++;
+        if (attemptIndex < decodeAttempts.length) tryBitmap(); else legacyDecode();
       });
-    } else {
-      legacyDecode();
     }
+
+    tryBitmap();
   }
 
   document.getElementById("qtyMinus").onclick = function(){
